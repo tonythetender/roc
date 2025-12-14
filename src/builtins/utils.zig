@@ -19,6 +19,37 @@ const RocCrashed = @import("host_abi.zig").RocCrashed;
 
 const DEBUG_TESTING_ALLOC = false;
 
+/// Performs a pointer cast with debug-mode alignment verification.
+///
+/// In debug builds, verifies that the pointer is properly aligned for the target type
+/// and panics with detailed diagnostic information if alignment is incorrect.
+/// In release builds, this is equivalent to `@ptrCast(@alignCast(ptr))`.
+///
+/// Usage:
+/// ```
+/// const typed_ptr: *usize = alignedPtrCast(*usize, raw_ptr, @src());
+/// ```
+///
+/// The `src` parameter should always be `@src()` at the call site - this captures
+/// the file, function, and line number to aid in reproducing alignment bugs.
+pub inline fn alignedPtrCast(comptime T: type, ptr: anytype, src: std.builtin.SourceLocation) T {
+    if (comptime builtin.mode == .Debug) {
+        const ptr_info = @typeInfo(T);
+        const alignment = switch (ptr_info) {
+            .pointer => |p| p.alignment,
+            else => @compileError("alignedPtrCast target must be a pointer type"),
+        };
+        const ptr_int = @intFromPtr(ptr);
+        if (alignment > 0 and ptr_int % alignment != 0) {
+            std.debug.panic(
+                "Alignment error at {s}:{d} in {s}: ptr=0x{x} is not {d}-byte aligned (required for {s})",
+                .{ src.file, src.line, src.fn_name, ptr_int, alignment, @typeName(T) },
+            );
+        }
+    }
+    return @ptrCast(@alignCast(ptr));
+}
+
 /// Tracks allocations for testing purposes with C ABI compatibility. Uses a single global testing allocator to track allocations. If we need multiple independent allocators we will need to modify this and use comptime.
 pub const TestEnv = struct {
     const AllocationInfo = struct {
@@ -292,6 +323,9 @@ pub fn decrefRcPtrC(
 }
 
 /// Safely decrements reference count for a potentially null pointer
+/// WARNING: This function assumes `bytes` points to 8-byte aligned data.
+/// It should NOT be used for seamless slices with non-zero start offsets,
+/// as those have misaligned bytes pointers. Use RocList.decref instead.
 pub fn decrefCheckNullC(
     bytes_or_null: ?[*]u8,
     alignment: u32,
@@ -299,7 +333,7 @@ pub fn decrefCheckNullC(
     roc_ops: *RocOps,
 ) callconv(.c) void {
     if (bytes_or_null) |bytes| {
-        const isizes: [*]isize = @as([*]isize, @ptrCast(@alignCast(bytes)));
+        const isizes: [*]isize = alignedPtrCast([*]isize, bytes, @src());
         return @call(
             .always_inline,
             decref_ptr_to_refcount,
@@ -320,8 +354,23 @@ pub fn decrefDataPtrC(
     const bytes = bytes_or_null orelse return;
 
     const data_ptr = @intFromPtr(bytes);
+
+    // Verify original pointer is properly aligned
+    if (comptime builtin.mode == .Debug) {
+        if (data_ptr % @alignOf(usize) != 0) {
+            std.debug.panic("decrefDataPtrC: ORIGINAL data_ptr=0x{x} is not {}-byte aligned!", .{ data_ptr, @alignOf(usize) });
+        }
+    }
+
     const tag_mask: usize = if (@sizeOf(usize) == 8) 0b111 else 0b11;
     const unmasked_ptr = data_ptr & ~tag_mask;
+
+    // Verify alignment before @ptrFromInt
+    if (comptime builtin.mode == .Debug) {
+        if (unmasked_ptr % @alignOf(isize) != 0) {
+            std.debug.panic("decrefDataPtrC: unmasked_ptr=0x{x} (data_ptr=0x{x}) is not {}-byte aligned", .{ unmasked_ptr, data_ptr, @alignOf(isize) });
+        }
+    }
 
     const isizes: [*]isize = @as([*]isize, @ptrFromInt(unmasked_ptr));
     const rc_ptr = isizes - 1;
@@ -339,10 +388,26 @@ pub fn increfDataPtrC(
     const bytes = bytes_or_null orelse return;
 
     const ptr = @intFromPtr(bytes);
+
+    // Verify original pointer is properly aligned (can fail if seamless slice encoding produces bad pointer)
+    if (comptime builtin.mode == .Debug) {
+        if (ptr % @alignOf(usize) != 0) {
+            std.debug.panic("increfDataPtrC: ORIGINAL ptr=0x{x} is not {}-byte aligned!", .{ ptr, @alignOf(usize) });
+        }
+    }
+
     const tag_mask: usize = if (@sizeOf(usize) == 8) 0b111 else 0b11;
     const masked_ptr = ptr & ~tag_mask;
+    const rc_addr = masked_ptr - @sizeOf(usize);
 
-    const isizes: *isize = @as(*isize, @ptrFromInt(masked_ptr - @sizeOf(usize)));
+    // Verify alignment before @ptrFromInt
+    if (comptime builtin.mode == .Debug) {
+        if (rc_addr % @alignOf(isize) != 0) {
+            std.debug.panic("increfDataPtrC: rc_addr=0x{x} (ptr=0x{x}, masked=0x{x}) is not {}-byte aligned", .{ rc_addr, ptr, masked_ptr, @alignOf(isize) });
+        }
+    }
+
+    const isizes: *isize = @as(*isize, @ptrFromInt(rc_addr));
 
     return increfRcPtrC(isizes, inc_amount);
 }
@@ -361,6 +426,13 @@ pub fn freeDataPtrC(
     const ptr = @intFromPtr(bytes);
     const tag_mask: usize = if (@sizeOf(usize) == 8) 0b111 else 0b11;
     const masked_ptr = ptr & ~tag_mask;
+
+    // Verify alignment before @ptrFromInt
+    if (comptime builtin.mode == .Debug) {
+        if (masked_ptr % @alignOf(isize) != 0) {
+            std.debug.panic("freeDataPtrC: masked_ptr=0x{x} (ptr=0x{x}) is not {}-byte aligned", .{ masked_ptr, ptr, @alignOf(isize) });
+        }
+    }
 
     const isizes: [*]isize = @as([*]isize, @ptrFromInt(masked_ptr));
 
@@ -395,7 +467,7 @@ pub fn decref(
 
     const bytes = bytes_or_null orelse return;
 
-    const isizes: [*]isize = @as([*]isize, @ptrCast(@alignCast(bytes)));
+    const isizes: [*]isize = alignedPtrCast([*]isize, bytes, @src());
 
     decref_ptr_to_refcount(isizes - 1, alignment, elements_refcounted, roc_ops);
 }
@@ -488,6 +560,13 @@ pub fn isUnique(
     const tag_mask: usize = if (@sizeOf(usize) == 8) 0b111 else 0b11;
     const masked_ptr = ptr & ~tag_mask;
 
+    // Verify alignment before @ptrFromInt
+    if (comptime builtin.mode == .Debug) {
+        if (masked_ptr % @alignOf(isize) != 0) {
+            std.debug.panic("isUnique: masked_ptr=0x{x} (ptr=0x{x}) is not {}-byte aligned", .{ masked_ptr, ptr, @alignOf(isize) });
+        }
+    }
+
     const isizes: [*]isize = @as([*]isize, @ptrFromInt(masked_ptr));
 
     const refcount = (isizes - 1)[0];
@@ -536,7 +615,7 @@ pub inline fn rcConstant(refcount: isize) bool {
 pub inline fn assertValidRefcount(data_ptr: ?[*]u8) void {
     if (builtin.mode != .Debug) return;
     if (data_ptr) |ptr| {
-        const rc_ptr: [*]isize = @ptrCast(@alignCast(ptr - @sizeOf(usize)));
+        const rc_ptr: [*]isize = alignedPtrCast([*]isize, ptr - @sizeOf(usize), @src());
         const rc = rc_ptr[0];
         if (rc == POISON_VALUE) {
             @panic("assertValidRefcount: Use-after-free detected");
@@ -638,7 +717,8 @@ pub fn allocateWithRefcount(
     const new_bytes = @as([*]u8, @ptrCast(roc_alloc_args.answer));
 
     const data_ptr = new_bytes + extra_bytes;
-    const refcount_ptr = @as([*]usize, @ptrCast(@as([*]align(ptr_width) u8, @alignCast(data_ptr)) - ptr_width));
+
+    const refcount_ptr: [*]usize = alignedPtrCast([*]usize, data_ptr - @sizeOf(usize), @src());
     refcount_ptr[0] = if (RC_TYPE == .none) REFCOUNT_STATIC_DATA else 1;
 
     return data_ptr;

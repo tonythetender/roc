@@ -849,6 +849,19 @@ test "e_low_level_lambda - List.append for already refcounted elt" {
     try testing.expectEqual(@as(i128, 4), len_value);
 }
 
+test "e_low_level_lambda - List.append for list of tuples with strings (issue 8650)" {
+    // This test reproduces issue #8650 - use-after-free when appending tuples containing strings.
+    // The bug was that isRefcounted() returns false for tuples, so strings inside tuples
+    // weren't being increffed before the append, leading to use-after-free.
+    const src =
+        \\x = List.append([("a", "b")], ("hello", "world"))
+        \\len = List.len(x)
+    ;
+
+    const len_value = try evalModuleAndGetInt(src, 1);
+    try testing.expectEqual(@as(i128, 2), len_value);
+}
+
 test "e_low_level_lambda - List.drop_at on an empty list at index 0" {
     const src =
         \\x = List.drop_at([], 0)
@@ -2076,9 +2089,7 @@ test "e_low_level_lambda - U8.plus method call syntax" {
     try testing.expectEqual(@as(i128, 8), value);
 }
 
-// =============================================================================
 // mod_by tests for integer types
-// =============================================================================
 
 test "e_low_level_lambda - U8.mod_by basic" {
     const src =
@@ -2187,9 +2198,7 @@ test "e_low_level_lambda - I64.mod_by with zero result" {
     try testing.expectEqual(@as(i128, 0), value);
 }
 
-// =============================================================================
 // List.sort_with tests
-// =============================================================================
 
 test "e_low_level_lambda - List.sort_with basic ascending sort" {
     const src =

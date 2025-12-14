@@ -46,7 +46,6 @@ const Scratch = struct {
     if_branches: base.Scratch(CIR.Expr.IfBranch.Idx),
     where_clauses: base.Scratch(CIR.WhereClause.Idx),
     patterns: base.Scratch(CIR.Pattern.Idx),
-    pattern_record_fields: base.Scratch(CIR.PatternRecordField.Idx),
     record_destructs: base.Scratch(CIR.Pattern.RecordDestruct.Idx),
     type_annos: base.Scratch(CIR.TypeAnno.Idx),
     anno_record_fields: base.Scratch(CIR.TypeAnno.RecordField.Idx),
@@ -67,7 +66,6 @@ const Scratch = struct {
             .if_branches = try base.Scratch(CIR.Expr.IfBranch.Idx).init(gpa),
             .where_clauses = try base.Scratch(CIR.WhereClause.Idx).init(gpa),
             .patterns = try base.Scratch(CIR.Pattern.Idx).init(gpa),
-            .pattern_record_fields = try base.Scratch(CIR.PatternRecordField.Idx).init(gpa),
             .record_destructs = try base.Scratch(CIR.Pattern.RecordDestruct.Idx).init(gpa),
             .type_annos = try base.Scratch(CIR.TypeAnno.Idx).init(gpa),
             .anno_record_fields = try base.Scratch(CIR.TypeAnno.RecordField.Idx).init(gpa),
@@ -89,7 +87,6 @@ const Scratch = struct {
         self.if_branches.deinit();
         self.where_clauses.deinit();
         self.patterns.deinit();
-        self.pattern_record_fields.deinit();
         self.record_destructs.deinit();
         self.type_annos.deinit();
         self.anno_record_fields.deinit();
@@ -275,9 +272,6 @@ pub fn getStatement(store: *const NodeStore, statement: CIR.Statement.Idx) CIR.S
         .statement_dbg => return CIR.Statement{ .s_dbg = .{
             .expr = @enumFromInt(node.data_1),
         } },
-        .statement_inspect => return CIR.Statement{ .s_inspect = .{
-            .expr = @enumFromInt(node.data_1),
-        } },
         .statement_expr => return .{ .s_expr = .{
             .expr = @enumFromInt(node.data_1),
         } },
@@ -358,6 +352,15 @@ pub fn getStatement(store: *const NodeStore, statement: CIR.Statement.Idx) CIR.S
                     .name = name,
                     .anno = anno,
                     .where = where_clause,
+                },
+            };
+        },
+        .statement_type_var_alias => {
+            return CIR.Statement{
+                .s_type_var_alias = .{
+                    .alias_name = @bitCast(node.data_1),
+                    .type_var_name = @bitCast(node.data_2),
+                    .type_var_anno = @enumFromInt(node.data_3),
                 },
             };
         },
@@ -653,11 +656,6 @@ pub fn getExpr(store: *const NodeStore, expr: CIR.Expr.Idx) CIR.Expr {
                 .expr = @enumFromInt(node.data_1),
             } };
         },
-        .expr_inspect => {
-            return CIR.Expr{ .e_inspect = .{
-                .expr = @enumFromInt(node.data_1),
-            } };
-        },
         .expr_unary_minus => {
             return CIR.Expr{ .e_unary_minus = .{
                 .expr = @enumFromInt(node.data_1),
@@ -689,6 +687,22 @@ pub fn getExpr(store: *const NodeStore, expr: CIR.Expr.Idx) CIR.Expr {
         .expr_return => {
             return CIR.Expr{ .e_return = .{
                 .expr = @enumFromInt(node.data_1),
+            } };
+        },
+        .expr_type_var_dispatch => {
+            // Retrieve type var dispatch data from node and extra_data
+            const type_var_alias_stmt: CIR.Statement.Idx = @enumFromInt(node.data_1);
+            const method_name: base.Ident.Idx = @bitCast(node.data_2);
+            const extra_start = node.data_3;
+            const extra_data = store.extra_data.items.items[extra_start..];
+
+            const args_start = extra_data[0];
+            const args_len = extra_data[1];
+
+            return CIR.Expr{ .e_type_var_dispatch = .{
+                .type_var_alias_stmt = type_var_alias_stmt,
+                .method_name = method_name,
+                .args = .{ .span = .{ .start = args_start, .len = args_len } },
             } };
         },
         .expr_hosted_lambda => {
@@ -1127,12 +1141,6 @@ pub fn getPattern(store: *const NodeStore, pattern_idx: CIR.Pattern.Idx) CIR.Pat
     }
 }
 
-/// Retrieves a pattern record field from the store.
-pub fn getPatternRecordField(_: *NodeStore, _: CIR.PatternRecordField.Idx) CIR.PatternRecordField {
-    // Return empty placeholder since PatternRecordField has no fields yet
-    return CIR.PatternRecordField{};
-}
-
 /// Retrieves a type annotation from the store.
 pub fn getTypeAnno(store: *const NodeStore, typeAnno: CIR.TypeAnno.Idx) CIR.TypeAnno {
     const node_idx: Node.Idx = @enumFromInt(@intFromEnum(typeAnno));
@@ -1214,9 +1222,12 @@ pub fn getTypeAnno(store: *const NodeStore, typeAnno: CIR.TypeAnno.Idx) CIR.Type
         .ty_tuple => return CIR.TypeAnno{ .tuple = .{
             .elems = .{ .span = .{ .start = node.data_1, .len = node.data_2 } },
         } },
-        .ty_record => return CIR.TypeAnno{ .record = .{
-            .fields = .{ .span = .{ .start = node.data_1, .len = node.data_2 } },
-        } },
+        .ty_record => return CIR.TypeAnno{
+            .record = .{
+                .fields = .{ .span = .{ .start = node.data_1, .len = node.data_2 } },
+                .ext = if (node.data_3 != 0) @enumFromInt(node.data_3 - OPTIONAL_VALUE_OFFSET) else null,
+            },
+        },
         .ty_fn => {
             const extra_data_idx = node.data_3;
             const effectful = store.extra_data.items.items[extra_data_idx] != 0;
@@ -1395,10 +1406,6 @@ fn makeStatementNode(store: *NodeStore, statement: CIR.Statement) Allocator.Erro
             node.tag = .statement_dbg;
             node.data_1 = @intFromEnum(s.expr);
         },
-        .s_inspect => |s| {
-            node.tag = .statement_inspect;
-            node.data_1 = @intFromEnum(s.expr);
-        },
         .s_expr => |s| {
             node.tag = .statement_expr;
             node.data_1 = @intFromEnum(s.expr);
@@ -1493,6 +1500,12 @@ fn makeStatementNode(store: *NodeStore, statement: CIR.Statement) Allocator.Erro
 
             // Store the extra data start position in the node
             node.data_1 = @intCast(extra_start);
+        },
+        .s_type_var_alias => |s| {
+            node.tag = .statement_type_var_alias;
+            node.data_1 = @bitCast(s.alias_name);
+            node.data_2 = @bitCast(s.type_var_name);
+            node.data_3 = @intFromEnum(s.type_var_anno);
         },
         .s_runtime_error => |s| {
             node.data_1 = @intFromEnum(s.diagnostic);
@@ -1658,10 +1671,6 @@ pub fn addExpr(store: *NodeStore, expr: CIR.Expr, region: base.Region) Allocator
             node.tag = .expr_dbg;
             node.data_1 = @intFromEnum(d.expr);
         },
-        .e_inspect => |d| {
-            node.tag = .expr_inspect;
-            node.data_1 = @intFromEnum(d.expr);
-        },
         .e_ellipsis => |_| {
             node.tag = .expr_ellipsis;
         },
@@ -1671,6 +1680,20 @@ pub fn addExpr(store: *NodeStore, expr: CIR.Expr, region: base.Region) Allocator
         .e_return => |ret| {
             node.tag = .expr_return;
             node.data_1 = @intFromEnum(ret.expr);
+        },
+        .e_type_var_dispatch => |tvd| {
+            node.tag = .expr_type_var_dispatch;
+            // data_1 = type_var_alias_stmt (Statement.Idx)
+            // data_2 = method_name (Ident.Idx)
+            // extra_data: args span start, args span len
+            node.data_1 = @intFromEnum(tvd.type_var_alias_stmt);
+            node.data_2 = @bitCast(tvd.method_name);
+
+            const extra_data_start = store.extra_data.len();
+            _ = try store.extra_data.append(store.gpa, tvd.args.span.start);
+            _ = try store.extra_data.append(store.gpa, tvd.args.span.len);
+
+            node.data_3 = @intCast(extra_data_start);
         },
         .e_hosted_lambda => |hosted| {
             node.tag = .expr_hosted_lambda;
@@ -2139,11 +2162,6 @@ pub fn addPattern(store: *NodeStore, pattern: CIR.Pattern, region: base.Region) 
     return @enumFromInt(@intFromEnum(node_idx));
 }
 
-/// Adds a pattern record field to the store.
-pub fn addPatternRecordField(_: *NodeStore, _: CIR.PatternRecordField) Allocator.Error!CIR.PatternRecordField.Idx {
-    @panic("TODO: addPatternRecordField not implemented");
-}
-
 /// Adds a type annotation to the store.
 ///
 /// IMPORTANT: You should not use this function directly! Instead, use it's
@@ -2233,6 +2251,7 @@ pub fn addTypeAnno(store: *NodeStore, typeAnno: CIR.TypeAnno, region: base.Regio
         .record => |r| {
             node.data_1 = r.fields.span.start;
             node.data_2 = r.fields.span.len;
+            node.data_3 = if (r.ext) |ext| @intFromEnum(ext) + OPTIONAL_VALUE_OFFSET else 0;
             node.tag = .ty_record;
         },
         .@"fn" => |f| {
@@ -3609,7 +3628,7 @@ pub const Serialized = extern struct {
     /// Deserialize this Serialized struct into a NodeStore
     pub fn deserialize(self: *Serialized, offset: i64, gpa: Allocator) *NodeStore {
         // Note: Serialized may be smaller than the runtime struct.
-        // CRITICAL: On 32-bit platforms, deserializing nodes in-place corrupts the adjacent
+        // On 32-bit platforms, deserializing nodes in-place corrupts the adjacent
         // regions and extra_data fields. We must deserialize in REVERSE order (last to first)
         // so that each deserialization doesn't corrupt fields that haven't been deserialized yet.
 

@@ -142,6 +142,15 @@ test "operator associativity - subtraction" {
     try runExpectInt("100 - (50 - (25 - 5))", 70, .no_trace); // Right associative would give 70
 }
 
+test "operator associativity - mixed addition and subtraction" {
+    // Regression test: + and - should have equal precedence and be left-associative
+    // Previously + had higher precedence than -, causing 1 - 2 + 3 to parse as 1 - (2 + 3) = -4
+    try runExpectInt("1 - 2 + 3", 2, .no_trace); // (1 - 2) + 3 = 2, NOT 1 - (2 + 3) = -4
+    try runExpectInt("5 + 3 - 2", 6, .no_trace); // (5 + 3) - 2 = 6
+    try runExpectInt("10 - 5 + 3 - 2", 6, .no_trace); // ((10 - 5) + 3) - 2 = 6
+    try runExpectInt("1 + 2 - 3 + 4 - 5", -1, .no_trace); // (((1 + 2) - 3) + 4) - 5 = -1
+}
+
 test "operator associativity - multiplication" {
     // Left associative: a * b * c should parse as (a * b) * c
     try runExpectInt("2 * 3 * 4", 24, .no_trace); // (2 * 3) * 4 = 24
@@ -1255,9 +1264,7 @@ test "List.fold with record accumulator - nested list and record" {
     );
 }
 
-// ============================================================================
 // Tests for List.map
-// ============================================================================
 
 test "List.map - basic identity" {
     // Map with identity function
@@ -1304,9 +1311,7 @@ test "List.map - adding" {
     );
 }
 
-// ============================================================================
 // Bug regression tests - interpreter crash issues
-// ============================================================================
 
 test "match with tag containing pattern-bound variable - regression" {
     // Regression test for GitHub issue: interpreter crash when creating a tag
@@ -1353,26 +1358,18 @@ test "nested match with Result type - regression" {
     , .no_trace);
 }
 
-// ============================================================================
 // Bug regression tests - segfault issues from bug reports
-// ============================================================================
 
 test "list equality - single element list - regression" {
-    // Regression test for segfault when comparing single element lists
-    // Bug report: `main! = || { _bool = [1] == [1] }`
     try runExpectBool("[1] == [1]", true, .no_trace);
 }
 
 test "list equality - nested lists - regression" {
-    // Regression test for segfault when comparing nested lists
-    // Bug report: `_bool = [[1],[2]] == [[1],[2]]`
-    try runExpectBool("[[1],[2]] == [[1],[2]]", true, .no_trace);
+    try runExpectBool("[[1, 2]] == [[1, 2]]", true, .no_trace);
 }
 
 test "list equality - single string element list - regression" {
-    // Regression test for crash trying to compare numeric scalars instead of string scalars
-    // Bug report: `main! = || { _bool = [""] == [""] }`
-    try runExpectBool("[\"\"] == [\"\"]", true, .no_trace);
+    try runExpectBool("[\"hello\"] == [\"hello\"]", true, .no_trace);
 }
 
 test "if block with local bindings - regression" {
@@ -1386,4 +1383,97 @@ test "if block with local bindings - regression" {
         \\}
         \\else 99
     , 0, .no_trace);
+}
+
+test "List.len returns proper U64 nominal type for method calls - regression" {
+    // Regression test for InvalidMethodReceiver when calling methods on List.len result
+    // Bug report: `n = List.len([]); _str = n.to_str()` crashed with InvalidMethodReceiver
+    // The issue was that List.len created a fresh runtime type variable instead of using
+    // the return_rt_var parameter, which prevented method resolution from finding the
+    // U64 nominal type information needed to look up .to_str()
+    try runExpectStr(
+        \\{
+        \\    n = List.len([])
+        \\    n.to_str()
+        \\}
+    , "0", .no_trace);
+
+    // Also test with non-empty list
+    try runExpectStr(
+        \\{
+        \\    n = List.len([1, 2, 3])
+        \\    n.to_str()
+        \\}
+    , "3", .no_trace);
+}
+
+test "List.get method dispatch on Try type - issue 8665" {
+    // Regression test for issue #8665: InvalidMethodReceiver crash when calling
+    // ok_or() method on the result of List.get() using dot notation.
+    // The function call syntax works: Try.ok_or(List.get(list, 0), "fallback")
+    // But method syntax crashes: List.get(list, 0).ok_or("fallback")
+    try runExpectStr(
+        \\{
+        \\    list = ["hello"]
+        \\    List.get(list, 0).ok_or("fallback")
+        \\}
+    , "hello", .no_trace);
+}
+
+test "record destructuring with assignment - regression" {
+    // Regression test for GitHub issue #8647
+    // Record destructuring should not cause TypeMismatch error during evaluation
+    try runExpectInt(
+        \\{
+        \\    rec = { x: 1, y: 2 }
+        \\    { x, y } = rec
+        \\    x + y
+        \\}
+    , 3, .no_trace);
+}
+
+test "record field access - regression 8647" {
+    // Regression test for GitHub issue #8647
+    // Record field access should work properly
+    try runExpectStr(
+        \\{
+        \\    rec = { name: "test" }
+        \\    rec.name
+        \\}
+    , "test", .no_trace);
+}
+
+test "record field access with multiple string fields - regression 8648" {
+    // Regression test for GitHub issue #8648
+    // Record field access with app module ident space
+    try runExpectStr(
+        \\{
+        \\    record = { x: "a", y: "b" }
+        \\    record.x
+        \\}
+    , "a", .no_trace);
+}
+
+test "method calls on numeric variables with flex types - regression" {
+    // Regression test for InvalidMethodReceiver when calling methods on numeric
+    // variables that have unconstrained (flex/rigid) types at compile time.
+    // Bug report: https://github.com/roc-lang/roc/issues/8663
+    // The issue was that when a numeric variable's compile-time type is flex,
+    // method dispatch would fail because it requires a nominal type (like Dec).
+
+    // Simple case: variable bound to numeric literal
+    try runExpectStr(
+        \\{
+        \\    x = 7.0
+        \\    x.to_str()
+        \\}
+    , "7.0", .no_trace);
+
+    // With integer literal (defaults to Dec, so output has decimal point)
+    try runExpectStr(
+        \\{
+        \\    x = 42
+        \\    x.to_str()
+        \\}
+    , "42.0", .no_trace);
 }

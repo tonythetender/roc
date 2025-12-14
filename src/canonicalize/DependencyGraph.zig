@@ -212,9 +212,6 @@ fn collectExprDependencies(
                     .s_dbg => |dbg| {
                         try collectExprDependencies(cir, dbg.expr, dependencies, allocator);
                     },
-                    .s_inspect => |inspect| {
-                        try collectExprDependencies(cir, inspect.expr, dependencies, allocator);
-                    },
                     .s_expr => |expr_stmt| {
                         try collectExprDependencies(cir, expr_stmt.expr, dependencies, allocator);
                     },
@@ -231,7 +228,7 @@ fn collectExprDependencies(
                     .s_return => |ret| {
                         try collectExprDependencies(cir, ret.expr, dependencies, allocator);
                     },
-                    .s_import, .s_alias_decl, .s_nominal_decl, .s_type_anno, .s_crash, .s_runtime_error => {},
+                    .s_import, .s_alias_decl, .s_nominal_decl, .s_type_anno, .s_type_var_alias, .s_crash, .s_runtime_error => {},
                 }
             }
             // Recurse into the final expression
@@ -272,10 +269,6 @@ fn collectExprDependencies(
             try collectExprDependencies(cir, dbg.expr, dependencies, allocator);
         },
 
-        .e_inspect => |inspect| {
-            try collectExprDependencies(cir, inspect.expr, dependencies, allocator);
-        },
-
         .e_expect => |expect| {
             try collectExprDependencies(cir, expect.body, dependencies, allocator);
         },
@@ -287,6 +280,13 @@ fn collectExprDependencies(
         .e_for => |for_expr| {
             try collectExprDependencies(cir, for_expr.expr, dependencies, allocator);
             try collectExprDependencies(cir, for_expr.body, dependencies, allocator);
+        },
+
+        .e_type_var_dispatch => |tvd| {
+            // Collect dependencies from the arguments
+            for (cir.store.exprSlice(tvd.args)) |arg_idx| {
+                try collectExprDependencies(cir, arg_idx, dependencies, allocator);
+            }
         },
 
         .e_runtime_error => {},

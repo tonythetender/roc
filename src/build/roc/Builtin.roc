@@ -37,6 +37,8 @@ Builtin :: [].{
 		join_with : List(Str), Str -> Str
 
 		is_eq : Str, Str -> Bool
+
+		inspect : _val -> Str
 	}
 
 	List(_item) :: [ProvidedByCompiler].{
@@ -116,6 +118,19 @@ Builtin :: [].{
 						acc
 					} else {
 						List.concat(acc, [elem])
+					},
+			)
+
+		count_if : List(a), (a -> Bool) -> U64
+		count_if = |list, predicate|
+			List.fold(
+				list,
+				0,
+				|acc, elem|
+					if predicate(elem) {
+						acc + 1
+					} else {
+						acc
 					},
 			)
 
@@ -206,6 +221,13 @@ Builtin :: [].{
 			len = List.len(list)
 			take_len = if (len <= n) 0 else len - n
 			List.sublist(list, { start: 0, len: take_len })
+		}
+
+		join_with : List(item), item -> item
+			where [item.join_with : List(item), item -> item]
+		join_with = |list, joiner| {
+			Item : item
+			Item.join_with(list, joiner)
 		}
 	}
 
