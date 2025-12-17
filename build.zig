@@ -31,6 +31,12 @@ const glibc_cross_targets = [_]CrossTarget{
     .{ .name = "arm64glibc", .query = .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu } },
 };
 
+/// Windows cross-compile targets
+const windows_cross_targets = [_]CrossTarget{
+    .{ .name = "x64win", .query = .{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .msvc } },
+    .{ .name = "arm64win", .query = .{ .cpu_arch = .aarch64, .os_tag = .windows, .abi = .msvc } },
+};
+
 /// All Linux cross-compile targets (musl + glibc)
 const linux_cross_targets = musl_cross_targets ++ glibc_cross_targets;
 
@@ -616,6 +622,143 @@ const CheckUnusedSuppressionStep = struct {
     }
 };
 
+/// Build step that checks for global stdio usage in CLI code.
+///
+/// The CLI code uses a context-based I/O pattern where stdout/stderr are accessed
+/// through `ctx.io.stdout()` and `ctx.io.stderr()`. This prepares for Zig's upcoming
+/// I/O interface changes where I/O is passed through functions (like Allocator).
+///
+/// This step enforces that pattern by failing the build if direct global stdio
+/// access is found in src/cli/main.zig.
+const CheckCliGlobalStdioStep = struct {
+    step: Step,
+
+    fn create(b: *std.Build) *CheckCliGlobalStdioStep {
+        const self = b.allocator.create(CheckCliGlobalStdioStep) catch @panic("OOM");
+        self.* = .{
+            .step = Step.init(.{
+                .id = Step.Id.custom,
+                .name = "check-cli-global-stdio",
+                .owner = b,
+                .makeFn = make,
+            }),
+        };
+        return self;
+    }
+
+    fn make(step: *Step, _: Step.MakeOptions) !void {
+        const b = step.owner;
+        const allocator = b.allocator;
+
+        var violations = std.ArrayList(Violation).empty;
+        defer violations.deinit(allocator);
+
+        // Only scan src/cli/main.zig
+        const file_path = "src/cli/main.zig";
+        const file = std.fs.cwd().openFile(file_path, .{}) catch |err| {
+            return step.fail("Failed to open {s}: {}", .{ file_path, err });
+        };
+        defer file.close();
+
+        const content = file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch |err| {
+            return step.fail("Failed to read {s}: {}", .{ file_path, err });
+        };
+        defer allocator.free(content);
+
+        var line_number: usize = 1;
+        var line_start: usize = 0;
+
+        for (content, 0..) |char, i| {
+            if (char == '\n') {
+                const line = content[line_start..i];
+                const trimmed = std.mem.trim(u8, line, " \t");
+
+                // Check for forbidden patterns that indicate global stdio usage
+                // These patterns bypass ctx.io and use global state
+                const forbidden_patterns = [_][]const u8{
+                    "std.io.getStdOut()",
+                    "std.io.getStdErr()",
+                    "std.fs.File.stdout()",
+                    "std.fs.File.stderr()",
+                };
+
+                for (forbidden_patterns) |pattern| {
+                    if (std.mem.indexOf(u8, trimmed, pattern) != null) {
+                        try violations.append(allocator, .{
+                            .file_path = file_path,
+                            .line_number = line_number,
+                            .line_content = try allocator.dupe(u8, trimmed),
+                            .pattern = pattern,
+                        });
+                    }
+                }
+
+                line_number += 1;
+                line_start = i + 1;
+            }
+        }
+
+        if (violations.items.len > 0) {
+            std.debug.print("\n", .{});
+            std.debug.print("=" ** 80 ++ "\n", .{});
+            std.debug.print("GLOBAL STDIO USAGE DETECTED IN CLI\n", .{});
+            std.debug.print("=" ** 80 ++ "\n\n", .{});
+
+            std.debug.print(
+                \\In the CLI code, we use context-based I/O, not global stdio functions.
+                \\
+                \\WHY THIS RULE EXISTS:
+                \\  1. TESTABILITY: Context-based I/O allows tests to inject mock writers
+                \\     to capture and verify output.
+                \\
+                \\  2. FUTURE COMPATIBILITY: Zig's upcoming I/O interface will pass I/O
+                \\     through functions (like Allocator). Using ctx.io prepares us for this.
+                \\
+                \\  3. CONSISTENCY: All CLI functions receive ctx which contains allocators
+                \\     and I/O. This provides a uniform interface for resources.
+                \\
+                \\WHAT TO DO INSTEAD:
+                \\  Access stdout/stderr through the CliContext:
+                \\
+                \\  Example - WRONG:
+                \\    const stdout = std.io.getStdOut().writer();
+                \\    const stderr = std.fs.File.stderr().writer();
+                \\
+                \\  Example - RIGHT:
+                \\    const stdout = ctx.io.stdout();
+                \\    const stderr = ctx.io.stderr();
+                \\
+                \\VIOLATIONS FOUND:
+                \\
+            , .{});
+
+            for (violations.items) |violation| {
+                std.debug.print("  {s}:{d}: found `{s}` in: {s}\n", .{
+                    violation.file_path,
+                    violation.line_number,
+                    violation.pattern,
+                    violation.line_content,
+                });
+            }
+
+            std.debug.print("\n" ++ "=" ** 80 ++ "\n", .{});
+
+            return step.fail(
+                "Found {d} global stdio usage(s) in CLI code. " ++
+                    "Use ctx.io.stdout() and ctx.io.stderr() instead.",
+                .{violations.items.len},
+            );
+        }
+    }
+
+    const Violation = struct {
+        file_path: []const u8,
+        line_number: usize,
+        line_content: []const u8,
+        pattern: []const u8,
+    };
+};
+
 fn checkFxPlatformTestCoverage(step: *Step) !void {
     const b = step.owner;
     std.debug.print("---- checking fx platform test coverage ----\n", .{});
@@ -996,6 +1139,8 @@ fn createTestPlatformHostLib(
     target: ResolvedTarget,
     optimize: OptimizeMode,
     roc_modules: modules.RocModules,
+    strip: bool,
+    omit_frame_pointer: ?bool,
 ) *Step.Compile {
     const lib = b.addLibrary(.{
         .name = name,
@@ -1004,15 +1149,17 @@ fn createTestPlatformHostLib(
             .root_source_file = b.path(host_path),
             .target = target,
             .optimize = optimize,
-            .strip = optimize != .Debug,
+            .strip = strip,
+            .omit_frame_pointer = omit_frame_pointer,
             .pic = true, // Enable Position Independent Code for PIE compatibility
         }),
     });
     configureBackend(lib, target);
     lib.root_module.addImport("builtins", roc_modules.builtins);
     lib.root_module.addImport("build_options", roc_modules.build_options);
-    // Force bundle compiler-rt to resolve runtime symbols like __main
-    lib.bundle_compiler_rt = true;
+    // Don't bundle compiler-rt in host libraries - roc_shim provides it
+    // Bundling it here causes duplicate symbol errors on Windows
+    lib.bundle_compiler_rt = false;
 
     return lib;
 }
@@ -1026,6 +1173,8 @@ fn buildAndCopyTestPlatformHostLib(
     target_name: []const u8,
     optimize: OptimizeMode,
     roc_modules: modules.RocModules,
+    strip: bool,
+    omit_frame_pointer: ?bool,
 ) *Step.UpdateSourceFiles {
     const lib = createTestPlatformHostLib(
         b,
@@ -1034,6 +1183,8 @@ fn buildAndCopyTestPlatformHostLib(
         target,
         optimize,
         roc_modules,
+        strip,
+        omit_frame_pointer,
     );
 
     // Use correct filename for target platform
@@ -1162,6 +1313,8 @@ fn setupTestPlatforms(
     optimize: OptimizeMode,
     roc_modules: modules.RocModules,
     test_platforms_step: *Step,
+    strip: bool,
+    omit_frame_pointer: ?bool,
 ) void {
     // Clear the Roc cache when test platforms are rebuilt to ensure stale cached hosts aren't used
     const clear_cache_step = createClearCacheStep(b);
@@ -1176,6 +1329,8 @@ fn setupTestPlatforms(
             native_target_name,
             optimize,
             roc_modules,
+            strip,
+            omit_frame_pointer,
         );
         clear_cache_step.dependOn(&copy_step.step);
     }
@@ -1192,6 +1347,27 @@ fn setupTestPlatforms(
                 cross_target.name,
                 optimize,
                 roc_modules,
+                strip,
+                omit_frame_pointer,
+            );
+            clear_cache_step.dependOn(&copy_step.step);
+        }
+    }
+
+    // Cross-compile for Windows targets
+    for (windows_cross_targets) |cross_target| {
+        const cross_resolved_target = b.resolveTargetQuery(cross_target.query);
+
+        for (all_test_platform_dirs) |platform_dir| {
+            const copy_step = buildAndCopyTestPlatformHostLib(
+                b,
+                platform_dir,
+                cross_resolved_target,
+                cross_target.name,
+                optimize,
+                roc_modules,
+                strip,
+                omit_frame_pointer,
             );
             clear_cache_step.dependOn(&copy_step.step);
         }
@@ -1207,6 +1383,8 @@ fn setupTestPlatforms(
             "wasm32",
             optimize,
             roc_modules,
+            strip,
+            omit_frame_pointer,
         );
         clear_cache_step.dependOn(&copy_step.step);
     }
@@ -1247,7 +1425,7 @@ pub fn build(b: *std.Build) void {
         break :blk b.standardTargetOptions(.{ .default_target = default_target_query });
     };
     const optimize = b.standardOptimizeOption(.{});
-    const strip = b.option(bool, "strip", "Omit debug information");
+    const strip_flag = b.option(bool, "strip", "Omit debug information");
     const no_bin = b.option(bool, "no-bin", "Skip emitting binaries (important for fast incremental compilation)") orelse false;
     const trace_eval = b.option(bool, "trace-eval", "Enable detailed evaluation tracing for debugging") orelse (optimize == .Debug);
     const trace_refcount = b.option(bool, "trace-refcount", "Enable detailed refcount tracing for debugging memory issues") orelse false;
@@ -1271,7 +1449,7 @@ pub fn build(b: *std.Build) void {
 
     // tracy profiler configuration
     const flag_enable_tracy = b.option([]const u8, "tracy", "Enable Tracy integration. Supply path to Tracy source");
-    const flag_tracy_callstack = b.option(bool, "tracy-callstack", "Include callstack information with Tracy data. Does nothing if -Dtracy is not provided") orelse (flag_enable_tracy != null);
+    const flag_tracy_callstack = b.option(bool, "tracy-callstack", "Include callstack information with Tracy data. Does nothing if -Dtracy is not provided") orelse false;
     const flag_tracy_allocation = b.option(bool, "tracy-allocation", "Include allocation information with Tracy data. Does nothing if -Dtracy is not provided") orelse (flag_enable_tracy != null);
     const flag_tracy_callstack_depth: u32 = b.option(u32, "tracy-callstack-depth", "Declare callstack depth for Tracy data. Does nothing if -Dtracy_callstack is not provided") orelse 10;
     if (flag_tracy_callstack) {
@@ -1284,14 +1462,35 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "trace_eval", trace_eval);
     build_options.addOption(bool, "trace_refcount", trace_refcount);
     build_options.addOption([]const u8, "compiler_version", getCompilerVersion(b, optimize));
-    if (target.result.os.tag == .macos and flag_tracy_callstack) {
-        std.log.warn("Tracy callstack does not work on MacOS, disabling.", .{});
-        build_options.addOption(bool, "enable_tracy_callstack", false);
-    } else {
-        build_options.addOption(bool, "enable_tracy_callstack", flag_tracy_callstack);
-    }
+    build_options.addOption(bool, "enable_tracy_callstack", flag_tracy_callstack);
     build_options.addOption(bool, "enable_tracy_allocation", flag_tracy_allocation);
     build_options.addOption(u32, "tracy_callstack_depth", flag_tracy_callstack_depth);
+
+    // Calculate effective strip value
+    // - If strip is explicitly set by user, use that (warn if tracy_callstack is also set)
+    // - Otherwise, default to stripping if not debug, unless tracy_callstack is enabled
+    const strip: bool = blk: {
+        if (strip_flag) |strip_bool| {
+            // User explicitly set strip
+            if (strip_bool and flag_tracy_callstack) {
+                std.log.warn("Both -Dstrip and -Dtracy-callstack are enabled. " ++
+                    "Stripping will remove callstack information needed by Tracy.", .{});
+            }
+            break :blk strip_bool;
+        } else {
+            // User did not set strip - use defaults
+            if (flag_tracy_callstack) {
+                // Don't strip when tracy callstack is enabled (preserves debug info)
+                break :blk false;
+            } else {
+                // Default: strip in release modes
+                break :blk optimize != .Debug;
+            }
+        }
+    };
+
+    // Don't omit frame pointer when tracy callstack is enabled (needed for callstack capture)
+    const omit_frame_pointer: ?bool = if (flag_tracy_callstack) false else null;
 
     const target_is_native =
         // `query.isNative()` becomes false as soon as users override CPU features (e.g. -Dcpu=x86_64_v3),
@@ -1386,9 +1585,9 @@ pub fn build(b: *std.Build) void {
     roc_modules.eval.addImport("compiled_builtins", compiled_builtins_module);
 
     // Setup test platform host libraries
-    setupTestPlatforms(b, target, optimize, roc_modules, test_platforms_step);
+    setupTestPlatforms(b, target, optimize, roc_modules, test_platforms_step, strip, omit_frame_pointer);
 
-    const roc_exe = addMainExe(b, roc_modules, target, optimize, strip, enable_llvm, use_system_llvm, user_llvm_path, flag_enable_tracy, zstd, compiled_builtins_module, write_compiled_builtins) orelse return;
+    const roc_exe = addMainExe(b, roc_modules, target, optimize, strip, omit_frame_pointer, enable_llvm, use_system_llvm, user_llvm_path, flag_enable_tracy, zstd, compiled_builtins_module, write_compiled_builtins, flag_enable_tracy) orelse return;
     roc_modules.addAll(roc_exe);
     install_and_run(b, no_bin, roc_exe, roc_step, run_step, run_args);
 
@@ -1750,6 +1949,10 @@ pub fn build(b: *std.Build) void {
     const check_unused = CheckUnusedSuppressionStep.create(b);
     test_step.dependOn(&check_unused.step);
 
+    // Add check for global stdio usage in CLI code
+    const check_cli_stdio = CheckCliGlobalStdioStep.create(b);
+    test_step.dependOn(&check_cli_stdio.step);
+
     test_step.dependOn(&tests_summary.step);
 
     b.default_step.dependOn(playground_step);
@@ -1797,6 +2000,8 @@ pub fn build(b: *std.Build) void {
             fx_host_target,
             optimize,
             roc_modules,
+            strip,
+            omit_frame_pointer,
         );
 
         // Copy the fx test platform host library to the source directory
@@ -1992,7 +2197,8 @@ fn addMainExe(
     roc_modules: modules.RocModules,
     target: ResolvedTarget,
     optimize: OptimizeMode,
-    strip: ?bool,
+    strip: bool,
+    omit_frame_pointer: ?bool,
     enable_llvm: bool,
     use_system_llvm: bool,
     user_llvm_path: ?[]const u8,
@@ -2000,6 +2206,7 @@ fn addMainExe(
     zstd: *Dependency,
     compiled_builtins_module: *std.Build.Module,
     write_compiled_builtins: *Step.WriteFile,
+    flag_enable_tracy: ?[]const u8,
 ) ?*Step.Compile {
     const exe = b.addExecutable(.{
         .name = "roc",
@@ -2008,6 +2215,7 @@ fn addMainExe(
             .target = target,
             .optimize = optimize,
             .strip = strip,
+            .omit_frame_pointer = omit_frame_pointer,
             .link_libc = true,
         }),
     });
@@ -2026,6 +2234,8 @@ fn addMainExe(
             native_target_name,
             optimize,
             roc_modules,
+            strip,
+            omit_frame_pointer,
         );
         b.getInstallStep().dependOn(&copy_step.step);
     }
@@ -2042,6 +2252,8 @@ fn addMainExe(
                 cross_target.name,
                 optimize,
                 roc_modules,
+                strip,
+                omit_frame_pointer,
             );
             b.getInstallStep().dependOn(&copy_step.step);
         }
@@ -2063,6 +2275,7 @@ fn addMainExe(
             .target = target,
             .optimize = optimize,
             .strip = strip,
+            .omit_frame_pointer = omit_frame_pointer,
             .pic = true, // Enable Position Independent Code for PIE compatibility
         }),
     });
@@ -2077,7 +2290,8 @@ fn addMainExe(
             .root_source_file = b.path("src/interpreter_shim/main.zig"),
             .target = target,
             .optimize = optimize,
-            .strip = optimize != .Debug,
+            .strip = strip,
+            .omit_frame_pointer = omit_frame_pointer,
             .pic = true, // Enable Position Independent Code for PIE compatibility
         }),
         .linkage = .static,
@@ -2103,6 +2317,9 @@ fn addMainExe(
     copy_shim.addCopyFileToSource(shim_lib.getEmittedBin(), b.pathJoin(&.{ "src/cli", interpreter_shim_filename }));
     exe.step.dependOn(&copy_shim.step);
 
+    // Add tracy support (required by parse/can/check modules)
+    add_tracy(b, roc_modules.build_options, shim_lib, b.graph.host, false, flag_enable_tracy);
+
     // Cross-compile interpreter shim for all supported targets
     // This allows `roc build --target=X` to work for cross-compilation
     const cross_compile_shim_targets = [_]struct { name: []const u8, query: std.Target.Query }{
@@ -2123,7 +2340,8 @@ fn addMainExe(
                 .root_source_file = b.path("src/builtins/static_lib.zig"),
                 .target = cross_resolved_target,
                 .optimize = optimize,
-                .strip = optimize != .Debug,
+                .strip = strip,
+                .omit_frame_pointer = omit_frame_pointer,
                 .pic = true,
             }),
         });
@@ -2136,7 +2354,8 @@ fn addMainExe(
                 .root_source_file = b.path("src/interpreter_shim/main.zig"),
                 .target = cross_resolved_target,
                 .optimize = optimize,
-                .strip = optimize != .Debug,
+                .strip = strip,
+                .omit_frame_pointer = omit_frame_pointer,
                 .pic = true,
             }),
             .linkage = .static,

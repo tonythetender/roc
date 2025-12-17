@@ -465,6 +465,10 @@ test "roc build creates executable from test/int/app.roc" {
 
     // 3. Output file is executable (non-zero size)
     try testing.expect(stat.size > 0);
+
+    // 4. Stdout contains success message
+    try testing.expect(result.stdout.len > 5);
+    try testing.expect(std.mem.indexOf(u8, result.stdout, "Successfully built") != null);
 }
 
 test "roc build executable runs correctly" {
@@ -528,6 +532,7 @@ test "roc build fails with file not found error" {
     // 2. Stderr contains file not found error
     const has_error = std.mem.indexOf(u8, result.stderr, "FileNotFound") != null or
         std.mem.indexOf(u8, result.stderr, "not found") != null or
+        std.mem.indexOf(u8, result.stderr, "NOT FOUND") != null or
         std.mem.indexOf(u8, result.stderr, "Failed") != null;
     try testing.expect(has_error);
 }

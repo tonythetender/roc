@@ -905,7 +905,7 @@ fn unifyWith(self: *Self, target_var: Var, content: types_mod.Content, env: *Env
         // directly, saving a typeslot and unifcation run
         var desc = resolved_target.desc;
         desc.content = content;
-        try self.types.setVarDesc(target_var, desc);
+        try self.types.dangerousSetVarDesc(target_var, desc);
     } else {
         const fresh_var = try self.freshFromContent(content, env, self.getRegionAt(target_var));
         if (builtin.mode == .Debug) {
@@ -1258,7 +1258,7 @@ fn checkDef(self: *Self, def_idx: CIR.Def.Idx, env: *Env) std.mem.Allocator.Erro
             _ = try self.checkExpr(def.expr, env, .no_expectation);
         }
 
-        // Now that we are existing the scope, we must generalize then pop this rank
+        // Now that we are exiting the scope, we must generalize then pop this rank
         try self.generalizer.generalize(self.gpa, &env.var_pool, env.rank());
 
         // Check any accumulated static dispatch constraints
@@ -2898,9 +2898,28 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
             }
 
             const pat_var = ModuleEnv.varFrom(lookup.pattern_idx);
-            const resolved_pat = self.types.resolveVar(pat_var).desc;
+            const resolved_pat = self.types.resolveVar(pat_var);
 
-            if (resolved_pat.rank == Rank.generalized) {
+            // Check if this is a generalized var that should NOT be instantiated.
+            // Numeric literals with from_numeral constraints should unify directly
+            // so that the concrete type propagates back to the definition site.
+            // This fixes GitHub issue #8666 where polymorphic numerics defaulted to Dec.
+            const should_instantiate = blk: {
+                if (resolved_pat.desc.rank != Rank.generalized) break :blk false;
+                // Don't instantiate if this has a from_numeral constraint
+                if (resolved_pat.desc.content == .flex) {
+                    const flex = resolved_pat.desc.content.flex;
+                    const constraints = self.types.sliceStaticDispatchConstraints(flex.constraints);
+                    for (constraints) |constraint| {
+                        if (constraint.origin == .from_numeral) {
+                            break :blk false;
+                        }
+                    }
+                }
+                break :blk true;
+            };
+
+            if (should_instantiate) {
                 const instantiated = try self.instantiateVar(pat_var, env, .use_last_var);
                 _ = try self.unify(expr_var, instantiated, env);
             } else {
@@ -3518,7 +3537,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                 },
                 .expected => |expected_type| {
                     // Redirect expr_var to the annotation var so that lookups get the correct type
-                    try self.types.setVarRedirect(expr_var, expected_type.var_);
+                    _ = try self.unify(expr_var, expected_type.var_, env);
                 },
             }
         },
@@ -3551,7 +3570,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                 },
                 .expected => |expected_type| {
                     // Redirect expr_var to the annotation var so that lookups get the correct type
-                    try self.types.setVarRedirect(expr_var, expected_type.var_);
+                    _ = try self.unify(expr_var, expected_type.var_, env);
                 },
             }
         },
@@ -4294,7 +4313,7 @@ fn checkUnaryMinusExpr(self: *Self, expr_idx: CIR.Expr.Idx, expr_region: Region,
     _ = try self.unify(constrained_var, operand_var, env);
 
     // Set the expression to redirect to the return type
-    try self.types.setVarRedirect(expr_var, ret_var);
+    _ = try self.unify(expr_var, ret_var, env);
 
     return does_fx;
 }
@@ -4405,7 +4424,7 @@ fn checkBinopExpr(
                 _ = try self.unify(constrained_var, lhs_var, env);
 
                 // Set the expression to redirect to the return type
-                try self.types.setVarRedirect(expr_var, ret_var);
+                _ = try self.unify(expr_var, ret_var, env);
             } else {
                 // Builtin numeric type: use standard numeric constraints
                 // This is the same as the other arithmetic operators
@@ -4439,7 +4458,7 @@ fn checkBinopExpr(
 
                 // Set root expr. If unifications succeeded this will the the
                 // num, otherwise the propgate error
-                try self.types.setVarRedirect(expr_var, lhs_var);
+                _ = try self.unify(expr_var, lhs_var, env);
             }
         },
         .sub, .mul, .div, .rem, .div_trunc => {
